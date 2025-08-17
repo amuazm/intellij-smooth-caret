@@ -1,7 +1,7 @@
 plugins {
     id("java")
-    id("org.jetbrains.kotlin.jvm") version "1.9.25"
-    id("org.jetbrains.intellij") version "1.17.4"
+    id("org.jetbrains.kotlin.jvm") version "2.1.20"
+    id("org.jetbrains.intellij.platform") version "2.7.0"
 }
 
 group = "dev.gorokhov"
@@ -9,15 +9,15 @@ version = "1.2.2"
 
 repositories {
     mavenCentral()
+    intellijPlatform { defaultRepositories() }
 }
 
 // Configure Gradle IntelliJ Plugin
 // Read more: https://plugins.jetbrains.com/docs/intellij/tools-gradle-intellij-plugin.html
-intellij {
-    version.set("2024.1.7")
-    type.set("IC") // Target IDE Platform
-
-    plugins.set(listOf(/* Plugin Dependencies */))
+dependencies {
+    intellijPlatform {
+        intellijIdeaCommunity("2025.2")
+    }
 }
 
 tasks {
@@ -32,7 +32,7 @@ tasks {
 
     patchPluginXml {
         sinceBuild.set("241")
-        untilBuild.set("251.*")
+        untilBuild.set("252.*")
     }
 
     signPlugin {
