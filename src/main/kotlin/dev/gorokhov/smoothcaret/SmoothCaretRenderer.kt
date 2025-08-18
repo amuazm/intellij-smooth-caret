@@ -8,6 +8,8 @@ import java.awt.Graphics
 import java.awt.Graphics2D
 import java.awt.GraphicsEnvironment
 import java.awt.RenderingHints
+import java.awt.event.FocusEvent
+import java.awt.event.FocusListener
 import javax.swing.Timer
 import kotlin.math.abs
 import kotlin.math.sin
@@ -15,34 +17,51 @@ import kotlin.math.sin
 class SmoothCaretRenderer(private val settings: SmoothCaretSettings) : CustomHighlighterRenderer {
     private val caretPositions = mutableMapOf<Caret, CaretPosition>()
     private var timer: Timer? = null
-    private var lastEditor: Editor? = null
+    private var blinkTimer: Timer? = null
+    private var currentEditor: Editor? = null
 
     private var cachedRefreshRate: Int = -1
-
     private var blinkStartTime = System.currentTimeMillis()
     private var lastMoveTime = System.currentTimeMillis()
     private val resumeBlinkDelay = 100
-    private var blinkTimer: Timer? = null
     private var cachedCharWidth: Int = 0
     private var cachedEditor: Editor? = null
     private val staticBlinkValue = BlinkValue(1.0f, 1.0f)
 
+    // Add focus listener to manage timers properly
+    private var focusListener: FocusListener? = null
+    private var isActive = false
+
     private data class CaretPosition(
-        var currentX: Double = 0.0, var currentY: Double = 0.0, var targetX: Double = 0.0, var targetY: Double = 0.0
+        var currentX: Double = 0.0,
+        var currentY: Double = 0.0,
+        var targetX: Double = 0.0,
+        var targetY: Double = 0.0
     )
+
+    private data class BlinkValue(val opacity: Float, val scaleY: Float)
 
     override fun paint(editor: Editor, highlighter: RangeHighlighter, g: Graphics) {
         if (!settings.isEnabled) return
 
-        if (!editor.contentComponent.hasFocus()) return
+        // Check if editor has focus - if not, stop timers to save resources
+        val hasFocus = editor.contentComponent.hasFocus()
+        if (!hasFocus) {
+            if (isActive) {
+                stopTimers()
+                isActive = false
+            }
+            return
+        }
 
-        if (lastEditor != editor) {
-            lastEditor = editor
-            resetAllPositions(editor)
-            blinkStartTime = System.currentTimeMillis()
+        // Handle editor switching more efficiently
+        if (currentEditor != editor) {
+            handleEditorSwitch(editor)
+        }
 
-            blinkTimer?.stop()
-            blinkTimer = null
+        if (!isActive) {
+            startTimers(editor)
+            isActive = true
         }
 
         val g2d = g as Graphics2D
@@ -50,11 +69,11 @@ class SmoothCaretRenderer(private val settings: SmoothCaretSettings) : CustomHig
 
         val allCarets = editor.caretModel.allCarets
 
-        ensureTimerStarted(editor)
-        ensureBlinkTimerStarted(editor)
-
         val currentTime = System.currentTimeMillis()
         var anyMoving = false
+
+        // Clean up positions for carets that no longer exist first
+        caretPositions.keys.retainAll { caret -> allCarets.contains(caret) }
 
         allCarets.forEach { caret ->
             val point = editor.visualPositionToXY(caret.visualPosition)
@@ -67,6 +86,7 @@ class SmoothCaretRenderer(private val settings: SmoothCaretSettings) : CustomHig
                 )
             }
 
+            // Handle teleportation (large jumps) more efficiently
             if (abs(point.x - caretPos.targetX) > 1000 || abs(point.y - caretPos.targetY) > 1000) {
                 resetCaretPosition(caretPos, point)
             }
@@ -74,8 +94,8 @@ class SmoothCaretRenderer(private val settings: SmoothCaretSettings) : CustomHig
             caretPos.targetX = point.x.toDouble()
             caretPos.targetY = point.y.toDouble()
 
-            val isMoving =
-                abs(caretPos.targetX - caretPos.currentX) > 0.01 || abs(caretPos.targetY - caretPos.currentY) > 0.01
+            val isMoving = abs(caretPos.targetX - caretPos.currentX) > 0.01 ||
+                    abs(caretPos.targetY - caretPos.currentY) > 0.01
             if (isMoving) {
                 anyMoving = true
             }
@@ -156,9 +176,124 @@ class SmoothCaretRenderer(private val settings: SmoothCaretSettings) : CustomHig
         }
 
         originalComposite?.let { g2d.composite = it }
+    }
 
-        // Clean up positions for carets that no longer exist
-        caretPositions.keys.retainAll { caret -> allCarets.contains(caret) }
+    private fun handleEditorSwitch(editor: Editor) {
+        // Clean up previous editor
+        stopTimers()
+        removeFocusListener()
+
+        // Reset state for new editor
+        currentEditor = editor
+        resetAllPositions(editor)
+        blinkStartTime = System.currentTimeMillis()
+
+        // Add focus listener to new editor
+        addFocusListener(editor)
+    }
+
+    private fun addFocusListener(editor: Editor) {
+        focusListener = object : FocusListener {
+            override fun focusGained(e: FocusEvent?) {
+                if (!isActive && settings.isEnabled) {
+                    startTimers(editor)
+                    isActive = true
+                }
+            }
+
+            override fun focusLost(e: FocusEvent?) {
+                if (isActive) {
+                    stopTimers()
+                    isActive = false
+                }
+            }
+        }
+        editor.contentComponent.addFocusListener(focusListener)
+    }
+
+    private fun removeFocusListener() {
+        currentEditor?.let { editor ->
+            focusListener?.let { listener ->
+                editor.contentComponent.removeFocusListener(listener)
+            }
+        }
+        focusListener = null
+    }
+
+    private fun startTimers(editor: Editor) {
+        if (timer == null) {
+            val refreshRate = getScreenRefreshRate()
+            val delay = (1000 / refreshRate).coerceAtLeast(16) // Minimum 16ms (60fps cap)
+
+            timer = Timer(delay) {
+                if (!editor.isDisposed && editor.contentComponent.hasFocus()) {
+                    updateCaretPositions(editor)
+                } else {
+                    stopTimers()
+                    isActive = false
+                }
+            }
+            timer?.start()
+        }
+
+        if (blinkTimer == null && settings.blinkingStyle != SmoothCaretSettings.BlinkingStyle.SOLID) {
+            val refreshRate = getScreenRefreshRate()
+            val delay = (1000 / refreshRate).coerceAtLeast(16)
+
+            blinkTimer = Timer(delay) {
+                if (!editor.isDisposed && editor.contentComponent.hasFocus()) {
+                    val timeSinceLastMove = System.currentTimeMillis() - lastMoveTime
+                    if (timeSinceLastMove > resumeBlinkDelay) {
+                        editor.contentComponent.repaint()
+                    }
+                } else {
+                    stopTimers()
+                    isActive = false
+                }
+            }
+            blinkTimer?.start()
+        }
+    }
+
+    private fun stopTimers() {
+        timer?.stop()
+        timer = null
+        blinkTimer?.stop()
+        blinkTimer = null
+    }
+
+    private fun updateCaretPositions(editor: Editor) {
+        var needsRepaint = false
+
+        if (settings.adaptiveSpeed && (cachedEditor != editor || cachedCharWidth == 0)) {
+            cachedCharWidth = editor.component.getFontMetrics(editor.colorsScheme.getFont(null)).charWidth('m')
+            cachedEditor = editor
+        }
+
+        caretPositions.values.forEach { caretPos ->
+            val dx = caretPos.targetX - caretPos.currentX
+            val dy = caretPos.targetY - caretPos.currentY
+
+            if (abs(dx) > 0.01 || abs(dy) > 0.01) {
+                val speedFactor = if (settings.adaptiveSpeed) {
+                    when {
+                        abs(dx) > cachedCharWidth * 2 -> settings.maxCatchupSpeed
+                        abs(dx) > cachedCharWidth -> settings.catchupSpeed
+                        else -> settings.smoothness
+                    }
+                } else {
+                    settings.smoothness
+                }
+
+                caretPos.currentX += dx * speedFactor
+                caretPos.currentY += dy * speedFactor
+                needsRepaint = true
+            }
+        }
+
+        if (needsRepaint) {
+            editor.contentComponent.repaint()
+        }
     }
 
     private fun calculateBlinkValue(timeInCycle: Float): BlinkValue {
@@ -218,28 +353,6 @@ class SmoothCaretRenderer(private val settings: SmoothCaretSettings) : CustomHig
         }
     }
 
-    private fun ensureBlinkTimerStarted(editor: Editor) {
-        if (blinkTimer == null && settings.blinkingStyle != SmoothCaretSettings.BlinkingStyle.SOLID) {
-            val refreshRate = getScreenRefreshRate()
-            val delay = 1000 / refreshRate
-
-            blinkTimer = Timer(delay) {
-                if (!editor.isDisposed) {
-                    val timeSinceLastMove = System.currentTimeMillis() - lastMoveTime
-                    if (timeSinceLastMove > resumeBlinkDelay) {
-                        editor.contentComponent.repaint()
-                    }
-                } else {
-                    blinkTimer?.stop()
-                    blinkTimer = null
-                }
-            }
-            blinkTimer?.start()
-        }
-    }
-
-    private data class BlinkValue(val opacity: Float, val scaleY: Float)
-
     private fun resetAllPositions(editor: Editor) {
         caretPositions.clear()
         val allCarets = editor.caretModel.allCarets
@@ -286,51 +399,12 @@ class SmoothCaretRenderer(private val settings: SmoothCaretSettings) : CustomHig
         return refreshRate
     }
 
-    private fun ensureTimerStarted(editor: Editor) {
-        if (timer == null) {
-            val refreshRate = getScreenRefreshRate()
-            val delay = 1000 / refreshRate
-
-            timer = Timer(delay) {
-                if (!editor.isDisposed) {
-                    var needsRepaint = false
-
-                    if (settings.adaptiveSpeed && (cachedEditor != editor || cachedCharWidth == 0)) {
-                        cachedCharWidth =
-                            editor.component.getFontMetrics(editor.colorsScheme.getFont(null)).charWidth('m')
-                        cachedEditor = editor
-                    }
-
-                    caretPositions.values.forEach { caretPos ->
-                        val dx = caretPos.targetX - caretPos.currentX
-                        val dy = caretPos.targetY - caretPos.currentY
-
-                        if (abs(dx) > 0.01 || abs(dy) > 0.01) {
-                            val speedFactor = if (settings.adaptiveSpeed) {
-                                when {
-                                    abs(dx) > cachedCharWidth * 2 -> settings.maxCatchupSpeed
-                                    abs(dx) > cachedCharWidth -> settings.catchupSpeed
-                                    else -> settings.smoothness
-                                }
-                            } else {
-                                settings.smoothness
-                            }
-
-                            caretPos.currentX += dx * speedFactor
-                            caretPos.currentY += dy * speedFactor
-                            needsRepaint = true
-                        }
-                    }
-
-                    if (needsRepaint) {
-                        editor.contentComponent.repaint()
-                    }
-                } else {
-                    timer?.stop()
-                    timer = null
-                }
-            }
-            timer?.start()
-        }
+    // Public cleanup method to be called from the listener
+    fun cleanup() {
+        stopTimers()
+        removeFocusListener()
+        caretPositions.clear()
+        currentEditor = null
+        isActive = false
     }
 }
