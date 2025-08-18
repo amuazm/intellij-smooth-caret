@@ -10,6 +10,10 @@ import java.awt.GraphicsEnvironment
 import java.awt.RenderingHints
 import java.awt.event.FocusEvent
 import java.awt.event.FocusListener
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
+import javax.swing.SwingUtilities
 import javax.swing.Timer
 import kotlin.math.abs
 import kotlin.math.sin
@@ -220,46 +224,97 @@ class SmoothCaretRenderer(private val settings: SmoothCaretSettings) : CustomHig
         focusListener = null
     }
 
-    private fun startTimers(editor: Editor) {
-        if (timer == null) {
-            val refreshRate = getScreenRefreshRate()
-            val delay = (1000 / refreshRate).coerceAtLeast(8)
+    private var animationExecutor: ScheduledExecutorService? = null
 
-            timer = Timer(delay) {
-                if (!editor.isDisposed && editor.contentComponent.hasFocus()) {
-                    updateCaretPositions(editor)
-                } else {
-                    stopTimers()
-                    isActive = false
+    private fun startTimers(editor: Editor) {
+        if (animationExecutor == null) {
+            animationExecutor = Executors.newSingleThreadScheduledExecutor { r ->
+                Thread(r, "SmoothCaret-Animator").apply {
+                    isDaemon = true
+                    priority = Thread.MAX_PRIORITY
                 }
             }
-            timer?.start()
-        }
 
-        if (blinkTimer == null && settings.blinkingStyle != SmoothCaretSettings.BlinkingStyle.SOLID) {
             val refreshRate = getScreenRefreshRate()
-            val delay = (1000 / refreshRate).coerceAtLeast(16)
+            val delayMicros = (1_000_000L / refreshRate)
 
-            blinkTimer = Timer(delay) {
+            animationExecutor?.scheduleAtFixedRate({
                 if (!editor.isDisposed && editor.contentComponent.hasFocus()) {
-                    val timeSinceLastMove = System.currentTimeMillis() - lastMoveTime
-                    if (timeSinceLastMove > resumeBlinkDelay) {
-                        editor.contentComponent.repaint()
+                    // Do the calculations on background thread
+                    val needsRepaint = updateCaretPositionsAndCheckBlink(editor)
+
+                    // But trigger the repaint on EDT
+                    if (needsRepaint) {
+                        SwingUtilities.invokeLater {
+                            if (!editor.isDisposed) {
+                                editor.contentComponent.repaint()
+                            }
+                        }
                     }
                 } else {
                     stopTimers()
                     isActive = false
                 }
-            }
-            blinkTimer?.start()
+            }, 0, delayMicros, TimeUnit.MICROSECONDS)
         }
     }
 
+    private fun updateCaretPositionsAndCheckBlink(editor: Editor): Boolean {
+        var needsRepaint = false
+
+        // Update caret positions (existing logic)
+        if (settings.adaptiveSpeed && (cachedEditor != editor || cachedCharWidth == 0)) {
+            cachedCharWidth = try {
+                editor.component.getFontMetrics(editor.colorsScheme.getFont(null)).charWidth('m')
+            } catch (e: Exception) {
+                10 // fallback
+            }
+            cachedEditor = editor
+        }
+
+        caretPositions.values.forEach { caretPos ->
+            val dx = caretPos.targetX - caretPos.currentX
+            val dy = caretPos.targetY - caretPos.currentY
+
+            if (abs(dx) > 0.01 || abs(dy) > 0.01) {
+                val speedFactor = if (settings.adaptiveSpeed) {
+                    when {
+                        abs(dx) > cachedCharWidth * 2 -> settings.maxCatchupSpeed
+                        abs(dx) > cachedCharWidth -> settings.catchupSpeed
+                        else -> settings.smoothness
+                    }
+                } else {
+                    settings.smoothness
+                }
+
+                caretPos.currentX += dx * speedFactor
+                caretPos.currentY += dy * speedFactor
+                needsRepaint = true
+            }
+        }
+
+        // IMPORTANT: Also check if we need to repaint for blinking
+        if (!needsRepaint && settings.blinkingStyle != SmoothCaretSettings.BlinkingStyle.SOLID) {
+            val currentTime = System.currentTimeMillis()
+            val timeSinceLastMove = currentTime - lastMoveTime
+
+            // If we're in blink mode and enough time has passed, we need to repaint
+            if (timeSinceLastMove > resumeBlinkDelay) {
+                needsRepaint = true
+            }
+        }
+
+        return needsRepaint
+    }
+
     private fun stopTimers() {
-        timer?.stop()
-        timer = null
-        blinkTimer?.stop()
-        blinkTimer = null
+        animationExecutor?.shutdown()
+        try {
+            animationExecutor?.awaitTermination(100, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            animationExecutor?.shutdownNow()
+        }
+        animationExecutor = null
     }
 
     private fun updateCaretPositions(editor: Editor) {
@@ -399,7 +454,6 @@ class SmoothCaretRenderer(private val settings: SmoothCaretSettings) : CustomHig
         return refreshRate
     }
 
-    // Public cleanup method to be called from the listener
     fun cleanup() {
         stopTimers()
         removeFocusListener()
