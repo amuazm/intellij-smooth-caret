@@ -223,7 +223,7 @@ class SmoothCaretRenderer(private val settings: SmoothCaretSettings) : CustomHig
     private fun startTimers(editor: Editor) {
         if (timer == null) {
             val refreshRate = getScreenRefreshRate()
-            val delay = (1000 / refreshRate).coerceAtLeast(16) // Minimum 16ms (60fps cap)
+            val delay = (1000 / refreshRate).coerceAtLeast(8)
 
             timer = Timer(delay) {
                 if (!editor.isDisposed && editor.contentComponent.hasFocus()) {
